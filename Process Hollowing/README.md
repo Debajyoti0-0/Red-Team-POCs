@@ -100,7 +100,7 @@ Build → Build Solution
 cl /EHsc /Fe:Poc.exe Poc.cpp /link winhttp.lib
 ```
 
-**Run as Administrator:**
+**Run:**
 ```bash
 Poc.exe
 ```
