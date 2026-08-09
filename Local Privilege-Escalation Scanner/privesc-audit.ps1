@@ -1,8 +1,9 @@
 <#
 PRIVESC-AUDIT.PS1  (v1.1.0)
-Local privilege-escalation surface scanner - writable DLLs/directories on
-NT AUTHORITY processes, weak service binary/registry ACLs, and SYSTEM-run
-scheduled tasks with writable action executables. Read-only, makes no changes.
+Local privilege-escalation attack-surface auditor: writable DLLs/directories on
+NT AUTHORITY processes, weak service binary/registry ACLs, SYSTEM-run scheduled
+tasks with writable actions, and (with -Deep) registry execution surfaces and
+host security context. Read-only - makes no changes to the system.
 #>
 
 #Requires -Version 5.1
@@ -31,7 +32,7 @@ param(
     [string]$MinSeverity = "All",
 
     [Alias("x")]
-    [ValidateSet("DLL", "Service", "ScheduledTask")]
+    [ValidateSet("DLL", "Service", "ScheduledTask", "Registry")]
     [string[]]$ExcludeCategory = @(),
 
     [switch]$NoColor,
@@ -41,21 +42,38 @@ param(
 
     [switch]$Version,
 
+    # Enables the heavier, lower-noise-to-signal-ratio checks: host/UAC context,
+    # AlwaysInstallElevated, Run/RunOnce/AppInit_DLLs/IFEO registry execution surfaces.
+    [switch]$Deep,
+
     # Catches things like "--help" that PowerShell's single-dash parser
     # won't bind to a named parameter, so we can still detect them.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Remaining
 )
 
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.0.0"
+
+function Show-Banner {
+    if ($Quiet) { return }
+    $line = "=" * 55
+    $banner = @"
+$line
+ Windows Privilege Escalation Audit Framework
+ Version: $ScriptVersion
+$line
+"@
+    if ($NoColor) { Write-Host $banner } else { Write-Host $banner -ForegroundColor Cyan }
+}
 
 function Show-Help {
     $help = @"
 
 PRIVESC-AUDIT.PS1  (v$ScriptVersion)
-Local privilege-escalation surface scanner - writable DLLs/directories on
-NT AUTHORITY processes, weak service binary/registry ACLs, and SYSTEM-run
-scheduled tasks with writable action executables. Read-only, makes no changes.
+Local privilege-escalation attack-surface auditor: writable DLLs/directories on
+NT AUTHORITY processes, weak service binary/registry ACLs, SYSTEM-run scheduled
+tasks with writable actions, and (with -Deep) registry execution surfaces and
+host security context. Read-only - makes no changes to the system.
 
 USAGE
     .\privesc-audit.ps1 [-h|--help] [options]
@@ -70,7 +88,10 @@ OPTIONS
     -IncludeServices[:`$false]   Audit service binaries + registry key ACLs. Default: on.
     -IncludeScheduledTasks[:`$false]
                                  Audit SYSTEM-run scheduled tasks. Default: on.
-    -x, -ExcludeCategory <c>    Skip a category entirely: DLL, Service, ScheduledTask.
+    -Deep                       Also audit Run/RunOnce/AppInit_DLLs/IFEO registry execution
+                                 surfaces, AlwaysInstallElevated, and host/UAC security context.
+                                 Off by default - these add scan time for lower-frequency findings.
+    -x, -ExcludeCategory <c>    Skip a category entirely: DLL, Service, ScheduledTask, Registry.
                                  Repeatable, e.g. -ExcludeCategory DLL,ScheduledTask
 
     -m, -MinSeverity <level>    Only show findings at or above this severity:
@@ -83,10 +104,25 @@ OPTIONS
     -Verbose                    Show DEBUG-level log lines (built-in PowerShell common parameter).
 
 EXAMPLES
-    .\privesc-audit.ps1 -AutoElevate -Format HTML
+    .\privesc-audit.ps1 -AutoElevate -Deep -Format HTML
     .\privesc-audit.ps1 -IncludeServices:`$false -Format CSV -OutputPath C:\Audit
     .\privesc-audit.ps1 -MinSeverity High -ExcludeCategory ScheduledTask
     .\privesc-audit.ps1 --help
+
+EXECUTION POLICY
+    If PowerShell refuses to run this script at all ("...cannot be loaded
+    because running scripts is disabled on this system"), that's a machine-
+    level ExecutionPolicy setting. It blocks the script before any code in
+    it can execute, so nothing inside this single .ps1 file can work around
+    it for that initial launch - run it once with:
+
+    > powershell -NoProfile -ExecutionPolicy Bypass -File .\privesc-audit.ps1
+    
+    That does not change your system's execution policy permanently - the
+    bypass only applies to that one process.
+    Once running, -AutoElevate's self-relaunch (for admin rights) DOES
+    automatically apply -ExecutionPolicy Bypass on its own, since that
+    relaunch happens from code already executing inside the script.
 
 "@
     Write-Host $help
@@ -113,6 +149,83 @@ if ($Remaining -and $Remaining.Count -gt 0) {
 # =============================================================================
 
 if (-not $LogFile) { $LogFile = Join-Path $OutputPath "privesc-audit.log" }
+
+# =============================================================================
+# GLOBAL STATE: coverage accounting + collection errors
+# A "0 findings" result must never be mistaken for "fully assessed" - these
+# track what was actually enumerated/inaccessible so the report is honest
+# about its own blind spots.
+# =============================================================================
+
+$Script:Coverage = [ordered]@{
+    ProcessesDiscovered   = 0
+    ProcessesAnalyzed     = 0
+    ProcessesInaccessible = 0
+    ServicesDiscovered    = 0
+    ServicesAnalyzed      = 0
+    TasksDiscovered       = 0
+    TasksAnalyzed         = 0
+    AclsRead              = 0
+    AclsInaccessible      = 0
+}
+$Script:CollectionErrors = @()
+
+function Add-CollectionError {
+    param([string]$Context, [string]$Reason)
+    $Script:CollectionErrors += [PSCustomObject]@{
+        Context   = $Context
+        Reason    = $Reason
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+}
+
+function New-Finding {
+    <#
+        Normalized finding object used by every audit module so downstream
+        table/CSV/HTML output doesn't have to special-case per-module shapes.
+        Category/PID/Process/Account/Target/Severity/Detail/Status are kept as
+        the "core" columns the console table renders; the rest is extra context
+        carried through to CSV/HTML for anyone who wants the full picture.
+    #>
+    param(
+        [string]$Category,
+        [string]$SubCategory = "",
+        [string]$Severity = "Medium",
+        [string]$Confidence = "Medium",
+        [string]$Exploitability = "Unknown",
+        [string]$PID2 = "-",
+        [string]$Process = "-",
+        [string]$Account = "-",
+        [string]$Target = "-",
+        [string]$TargetType = "",
+        [string]$Identity = "",
+        [string]$Rights = "",
+        [string]$Trigger = "",
+        [string]$Evidence = "",
+        [string]$Remediation = "",
+        [string]$Status = "OK"
+    )
+    [PSCustomObject]@{
+        FindingId      = [guid]::NewGuid().ToString().Substring(0, 8)
+        Category       = $Category
+        SubCategory    = $SubCategory
+        Severity       = $Severity
+        Confidence     = $Confidence
+        Exploitability = $Exploitability
+        PID            = $PID2
+        Process        = $Process
+        Account        = $Account
+        Target         = $Target
+        TargetType     = $TargetType
+        Identity       = $Identity
+        Rights         = $Rights
+        Trigger        = $Trigger
+        Detail         = $Evidence   # kept as "Detail" - existing table/HTML render this column
+        Remediation    = $Remediation
+        Status         = $Status
+        Timestamp      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+}
 
 function Write-Log {
     param(
@@ -162,6 +275,7 @@ function Invoke-WithRetry {
             Write-Log -Level DEBUG -Message "Attempt $attempt/$MaxAttempts failed for '$Context': $($ex.GetType().Name) - $($ex.Message)"
             if ($attempt -eq $MaxAttempts) {
                 Write-Log -Level WARN -Message "Giving up on '$Context' after $MaxAttempts attempts. Last error: $($ex.Message)"
+                Add-CollectionError -Context $Context -Reason "$($ex.GetType().Name): $($ex.Message)"
                 return $null
             }
             Start-Sleep -Milliseconds $DelayMs
@@ -194,6 +308,14 @@ function Test-Prerequisites {
         catch { $issues += "OutputPath '$OutputPath' does not exist and could not be created: $($_.Exception.Message)" }
     }
 
+    try {
+        $effectivePolicy = Get-ExecutionPolicy
+        Write-Log -Level DEBUG -Message "Effective ExecutionPolicy: $effectivePolicy"
+        if ($effectivePolicy -in @("Restricted", "AllSigned")) {
+            $issues += "ExecutionPolicy is '$effectivePolicy'. If -AutoElevate's elevated relaunch fails unexpectedly, try invoking this script directly with: powershell -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+        }
+    } catch { }
+
     return @{ IsAdmin = $isAdmin; Issues = $issues }
 }
 
@@ -204,17 +326,35 @@ function Test-Prerequisites {
 $prereq = Test-Prerequisites
 if (-not $prereq.IsAdmin) {
     if ($AutoElevate) {
-        Write-Log -Level WARN -Message "Not elevated. Relaunching with AutoElevate..."
+        Write-Log -Level WARN -Message "Not elevated. Relaunching elevated with -ExecutionPolicy Bypass..."
         $scriptPath = $MyInvocation.MyCommand.Path
+
+        # Use whatever PowerShell host is currently running this script (powershell.exe
+        # for 5.1, pwsh.exe for 7+) rather than hardcoding one, and always force
+        # -ExecutionPolicy Bypass on the child so the relaunch can't be blocked by a
+        # Restricted/AllSigned machine policy the way the original invocation might have been.
+        $hostExe = (Get-Process -Id $PID).Path
+        if (-not $hostExe) { $hostExe = "powershell.exe" }
+
         $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$scriptPath`"",
-                     "-OutputPath", "`"$OutputPath`"", "-Format", $Format)
+                     "-OutputPath", "`"$OutputPath`"", "-Format", $Format,
+                     "-MinSeverity", $MinSeverity, "-LogFile", "`"$LogFile`"")
         if ($IncludeServices)        { $argList += "-IncludeServices" }
         if ($IncludeScheduledTasks)  { $argList += "-IncludeScheduledTasks" }
+        if ($Deep)                   { $argList += "-Deep" }
+        if ($NoColor)                { $argList += "-NoColor" }
+        if ($Quiet)                  { $argList += "-Quiet" }
+        if ($ExcludeCategory -and $ExcludeCategory.Count -gt 0) {
+            $argList += "-ExcludeCategory"; $argList += ($ExcludeCategory -join ",")
+        }
+
         try {
-            Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -ErrorAction Stop
+            Start-Process -FilePath $hostExe -ArgumentList $argList -Verb RunAs -ErrorAction Stop
         }
         catch {
-            Write-Log -Level ERROR -Message "Elevation was declined or failed: $($_.Exception.Message)"
+            # Verb RunAs failing usually means UAC was declined, not an execution-policy
+            # problem - but surface both possibilities since they present identically to the user.
+            Write-Log -Level ERROR -Message "Elevation was declined or failed: $($_.Exception.Message). If this persists even when accepting the UAC prompt, try running manually: $hostExe -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
         }
         return
     }
@@ -233,14 +373,18 @@ Write-Log -Level INFO -Message "Starting privesc audit. Elevated=$($prereq.IsAdm
 # SHARED ACL EVALUATION
 # =============================================================================
 
-# Broader than "just NT AUTHORITY / owner / Administrators" - these are the
-# groups that actually show up in real-world writable-by-non-privileged-user findings.
+# Only identities that represent a LOWER-privileged principal than the target's
+# execution context belong here. Deliberately excludes:
+#   - the owning/running account itself (SYSTEM having rights on its own DLL is not a finding)
+#   - BUILTIN\Administrators (not exploitable unless current user IS an admin, in which
+#     case there's no privilege boundary being crossed)
+#   - a bare "NT AUTHORITY\*" wildcard (too broad - it would match SYSTEM itself)
+# This is the fix for the "SYSTEM has FullControl over its own DLL" false-positive class.
 $WeakIdentityPatterns = @(
     "Everyone",
     "*Authenticated Users*",
     "BUILTIN\Users",
-    "NT AUTHORITY\INTERACTIVE",
-    "NT AUTHORITY\*"
+    "NT AUTHORITY\INTERACTIVE"
 )
 
 function Get-WeakRights {
@@ -255,18 +399,26 @@ function Get-WeakRights {
         foreach ($pattern in $WeakIdentityPatterns) {
             if ($idRef -like $pattern) { $isWeakIdentity = $true; break }
         }
-        if ($idRef -eq $OwningAccount -or $idRef -eq "BUILTIN\Administrators") {
-            $isWeakIdentity = $true
-        }
         if (-not $isWeakIdentity) { continue }
 
         $rights = $entry.FileSystemRights.ToString()
-        if ($rights -notmatch "Write|Modify|FullControl") { continue }
 
-        # Severity: broad low-priv identity + strong rights = worse
-        $severity = "Medium"
-        if ($idRef -eq "Everyone" -or $idRef -like "*Authenticated Users*" -or $idRef -eq "BUILTIN\Users") {
-            $severity = if ($rights -match "FullControl|Modify") { "Critical" } else { "High" }
+        # WriteDac/WriteOwner are worse than plain Write: they let the holder
+        # rewrite the ACL itself (grant themselves FullControl) or take
+        # ownership, so they bypass whatever the "real" rights say entirely.
+        $hasDacOrOwner = $rights -match "WriteDac|WriteOwner|TakeOwnership"
+        $hasDataRights = $rights -match "Write|Modify|FullControl|CreateFiles|CreateDirectories|AppendData"
+
+        if (-not $hasDacOrOwner -and -not $hasDataRights) { continue }
+
+        $severity = if ($hasDacOrOwner) {
+            "Critical"
+        }
+        elseif ($rights -match "FullControl|Modify") {
+            "Critical"
+        }
+        else {
+            "High"
         }
 
         $findings += [PSCustomObject]@{
@@ -314,19 +466,26 @@ function Invoke-DllHijackAudit {
     }
 
     foreach ($p in $procs) {
+        $Script:Coverage.ProcessesDiscovered++
         $owner = Invoke-WithRetry -MaxAttempts 1 -Context "GetOwner PID $($p.ProcessId)" -Action {
             Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
         }
-        if (-not $owner -or $owner.ReturnValue -ne 0) { $skippedNoOwner++; continue }
+        if (-not $owner -or $owner.ReturnValue -ne 0) {
+            $skippedNoOwner++
+            $Script:Coverage.ProcessesInaccessible++
+            continue
+        }
         if ($owner.Domain -ne "NT AUTHORITY") { $skippedNotNtAuthority++; continue }
 
         $processed++
+        $Script:Coverage.ProcessesAnalyzed++
         $account = "$($owner.Domain)\$($owner.User)"
 
         $modules = Invoke-WithRetry -MaxAttempts 1 -Context "Get-Process -Module PID $($p.ProcessId)" -Action {
             Get-Process -Id $p.ProcessId -Module -ErrorAction Stop
         }
         if (-not $modules) {
+            $Script:Coverage.ProcessesInaccessible++
             $findings += [PSCustomObject]@{
                 Category = "DLL"; PID = $p.ProcessId; Process = $p.Name; Account = $account
                 Target = "-"; Severity = "-"; Detail = "-"; Status = "ACCESS DENIED"
@@ -339,6 +498,7 @@ function Invoke-DllHijackAudit {
             if (-not $dllPath -or -not (Test-Path -LiteralPath $dllPath -PathType Leaf)) { continue }
 
             $acl = Invoke-WithRetry -MaxAttempts 1 -Context "Get-Acl($dllPath)" -Action { Get-Acl -LiteralPath $dllPath -ErrorAction Stop }
+            if ($acl) { $Script:Coverage.AclsRead++ } else { $Script:Coverage.AclsInaccessible++ }
             $fileFindings = if ($acl) { Get-WeakRights -AclEntries $acl.Access -OwningAccount $account } else { @() }
             $dirFindings  = Get-DirectoryWriteRisk -Path $dllPath -OwningAccount $account
 
@@ -376,8 +536,10 @@ function Invoke-ServiceAudit {
     }
 
     foreach ($svc in $services) {
+        $Script:Coverage.ServicesDiscovered++
         $pathName = $svc.PathName
         if (-not $pathName) { continue }
+        $Script:Coverage.ServicesAnalyzed++
 
         # --- Unquoted service path check (classic privesc if path has spaces) ---
         if ($pathName -notmatch '^"' -and $pathName -match '\.exe' -and $pathName -match ' ') {
@@ -444,8 +606,10 @@ function Invoke-ScheduledTaskAudit {
     if (-not $tasks) { return $findings }
 
     foreach ($task in $tasks) {
+        $Script:Coverage.TasksDiscovered++
         $principal = $task.Principal
         if ($principal.UserId -notmatch "SYSTEM|LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY") { continue }
+        $Script:Coverage.TasksAnalyzed++
 
         foreach ($action in $task.Actions) {
             $exe = $action.Execute
@@ -469,13 +633,178 @@ function Invoke-ScheduledTaskAudit {
 }
 
 # =============================================================================
+# CHECK 4 (DEEP): HOST/UAC SECURITY CONTEXT
+# =============================================================================
+
+function Get-HostSecurityContext {
+    Write-Log -Level INFO -Message "Collecting host security context..."
+    $ctx = [ordered]@{
+        ComputerName = $env:COMPUTERNAME
+        CurrentUser  = "$env:USERDOMAIN\$env:USERNAME"
+        IsElevated   = $prereq.IsAdmin
+        PSVersion    = $PSVersionTable.PSVersion.ToString()
+    }
+
+    $os = Invoke-WithRetry -MaxAttempts 1 -Context "Get-CimInstance Win32_OperatingSystem" -Action { Get-CimInstance Win32_OperatingSystem -ErrorAction Stop }
+    if ($os) {
+        $ctx.OSCaption = $os.Caption
+        $ctx.OSBuild   = $os.BuildNumber
+        $ctx.OSArch    = $os.OSArchitecture
+    }
+
+    $uacPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    $uac = Invoke-WithRetry -MaxAttempts 1 -Context "Get-ItemProperty($uacPath)" -Action { Get-ItemProperty -Path $uacPath -ErrorAction Stop }
+    if ($uac) {
+        $ctx.EnableLUA = $uac.EnableLUA
+        $ctx.ConsentPromptBehaviorAdmin = $uac.ConsentPromptBehaviorAdmin
+        $ctx.LocalAccountTokenFilterPolicy = $uac.LocalAccountTokenFilterPolicy
+    }
+
+    return [PSCustomObject]$ctx
+}
+
+function Invoke-AlwaysInstallElevatedAudit {
+    $findings = @()
+    $hklm = Invoke-WithRetry -MaxAttempts 1 -Context "AlwaysInstallElevated HKLM" -Action {
+        Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name AlwaysInstallElevated -ErrorAction Stop
+    }
+    $hkcu = Invoke-WithRetry -MaxAttempts 1 -Context "AlwaysInstallElevated HKCU" -Action {
+        Get-ItemProperty -Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name AlwaysInstallElevated -ErrorAction Stop
+    }
+    $hklmSet = $hklm -and $hklm.AlwaysInstallElevated -eq 1
+    $hkcuSet = $hkcu -and $hkcu.AlwaysInstallElevated -eq 1
+
+    if ($hklmSet -and $hkcuSet) {
+        $findings += [PSCustomObject]@{
+            Category = "Registry (AlwaysInstallElevated)"; PID = "-"; Process = "-"; Account = "Any user"
+            Target = "HKLM+HKCU\...\Installer\AlwaysInstallElevated"; Severity = "Critical"
+            Detail = "Both HKLM and HKCU set to 1 - any user can run an MSI elevated to SYSTEM (msiexec /i malicious.msi)"; Status = "OK"
+        }
+    }
+    elseif ($hklmSet -or $hkcuSet) {
+        # Only one scope set is not exploitable on its own - both are required - but worth
+        # flagging as a misconfiguration since it's one policy push away from Critical.
+        $findings += [PSCustomObject]@{
+            Category = "Registry (AlwaysInstallElevated)"; PID = "-"; Process = "-"; Account = "Any user"
+            Target = "HKLM=$hklmSet HKCU=$hkcuSet"; Severity = "Medium"
+            Detail = "Only one of HKLM/HKCU is set - not exploitable alone, but half-configured for the MSI elevation vector"; Status = "OK"
+        }
+    }
+    return $findings
+}
+
+function Invoke-RegistryExecutionSurfaceAudit {
+    Write-Log -Level INFO -Message "Auditing registry execution surfaces (Run/RunOnce/AppInit_DLLs/IFEO)..."
+    $findings = @()
+
+    # --- Run / RunOnce: check both the key's own ACL for weak-identity SetValue rights,
+    #     and whether any referenced executable is itself writable. HKLM entries run for
+    #     every interactively-logged-on user (including admins), so a weak ACL here is a
+    #     privesc path even though HKCU entries only affect the current user's own context. ---
+    $runKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+    foreach ($keyPath in $runKeys) {
+        $acl = Invoke-WithRetry -MaxAttempts 1 -Context "Get-Acl($keyPath)" -Action { Get-Acl -LiteralPath $keyPath -ErrorAction Stop }
+        if (-not $acl) { continue }
+        foreach ($entry in $acl.Access) {
+            if ($entry.AccessControlType -ne "Allow") { continue }
+            $idRef = $entry.IdentityReference.ToString()
+            $isWeak = ($idRef -eq "Everyone" -or $idRef -like "*Authenticated Users*" -or $idRef -eq "BUILTIN\Users")
+            if (-not $isWeak) { continue }
+            $rights = $entry.RegistryRights.ToString()
+            if ($rights -notmatch "SetValue|FullControl|CreateSubKey|WriteKey") { continue }
+            $trigger = if ($keyPath -like "HKLM*") { "Runs for any interactive logon, including admins" } else { "Runs only for the current user - not a privilege boundary crossing by itself" }
+            $sev = if ($keyPath -like "HKLM*") { "High" } else { "Medium" }
+            $findings += [PSCustomObject]@{
+                Category = "Registry (Run key writable)"; PID = "-"; Process = "-"; Account = $idRef
+                Target = $keyPath; Severity = $sev; Detail = "$($idRef): $rights - $trigger"; Status = "OK"
+            }
+        }
+
+        $values = Invoke-WithRetry -MaxAttempts 1 -Context "Get-Item($keyPath)" -Action { Get-Item -LiteralPath $keyPath -ErrorAction Stop }
+        if (-not $values) { continue }
+        foreach ($valName in $values.GetValueNames()) {
+            $cmd = $values.GetValue($valName)
+            if (-not $cmd) { continue }
+            $exeGuess = ($cmd -replace '^"([^"]+)".*$', '$1') -replace '^([^ ]+\.exe).*$', '$1'
+            if (-not (Test-Path -LiteralPath $exeGuess -PathType Leaf)) { continue }
+            $exeAcl = Invoke-WithRetry -MaxAttempts 1 -Context "Get-Acl($exeGuess)" -Action { Get-Acl -LiteralPath $exeGuess -ErrorAction Stop }
+            if (-not $exeAcl) { continue }
+            foreach ($f in (Get-WeakRights -AclEntries $exeAcl.Access -OwningAccount "")) {
+                $findings += [PSCustomObject]@{
+                    Category = "Registry (Run target writable)"; PID = "-"; Process = $valName; Account = "-"
+                    Target = $exeGuess; Severity = $f.Severity; Detail = "$($f.Identity): $($f.Rights) on $keyPath\$valName target"; Status = "OK"
+                }
+            }
+        }
+    }
+
+    # --- AppInit_DLLs: DLLs loaded into every process that loads user32.dll if LoadAppInit_DLLs=1 ---
+    $appInitPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows"
+    $appInit = Invoke-WithRetry -MaxAttempts 1 -Context "Get-ItemProperty(AppInit_DLLs)" -Action { Get-ItemProperty -Path $appInitPath -ErrorAction Stop }
+    if ($appInit -and $appInit.LoadAppInit_DLLs -eq 1 -and $appInit.AppInit_DLLs) {
+        foreach ($dll in ($appInit.AppInit_DLLs -split '[, ]' | Where-Object { $_ })) {
+            if (-not (Test-Path -LiteralPath $dll -PathType Leaf)) { continue }
+            $acl = Invoke-WithRetry -MaxAttempts 1 -Context "Get-Acl($dll)" -Action { Get-Acl -LiteralPath $dll -ErrorAction Stop }
+            if (-not $acl) { continue }
+            foreach ($f in (Get-WeakRights -AclEntries $acl.Access -OwningAccount "")) {
+                $findings += [PSCustomObject]@{
+                    Category = "Registry (AppInit_DLLs writable)"; PID = "-"; Process = "-"; Account = "-"
+                    Target = $dll; Severity = "Critical"; Detail = "$($f.Identity): $($f.Rights) - loads into every user32.dll-linked process"; Status = "OK"
+                }
+            }
+        }
+    }
+
+    # --- IFEO Debugger hijack: a Debugger value on a common executable (sethc.exe, utilman.exe,
+    #     osk.exe etc) is a well-known persistence/backdoor technique - flag suspicious presence,
+    #     not just weak ACLs, since the mere existence of an unexpected Debugger value IS the finding. ---
+    $ifeoRoot = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+    $suspiciousTargets = @("sethc.exe", "utilman.exe", "osk.exe", "magnify.exe", "narrator.exe", "displayswitch.exe")
+    if (Test-Path $ifeoRoot) {
+        $subkeys = Invoke-WithRetry -MaxAttempts 1 -Context "Get-ChildItem($ifeoRoot)" -Action { Get-ChildItem -Path $ifeoRoot -ErrorAction Stop }
+        if ($subkeys) {
+            foreach ($sk in $subkeys) {
+                $exeName = Split-Path $sk.PSPath -Leaf
+                $dbg = Invoke-WithRetry -MaxAttempts 1 -Context "Get-ItemProperty($($sk.PSPath))" -Action { Get-ItemProperty -Path $sk.PSPath -Name Debugger -ErrorAction Stop }
+                if ($dbg -and $dbg.Debugger) {
+                    $sev = if ($exeName -in $suspiciousTargets) { "Critical" } else { "Medium" }
+                    $findings += [PSCustomObject]@{
+                        Category = "Registry (IFEO Debugger)"; PID = "-"; Process = $exeName; Account = "-"
+                        Target = "$ifeoRoot\$exeName"; Severity = $sev
+                        Detail = "Debugger='$($dbg.Debugger)' - launching $exeName instead runs this binary. $(if ($exeName -in $suspiciousTargets) { 'Matches known accessibility-tool backdoor pattern (Sticky Keys-style).' })"
+                        Status = "OK"
+                    }
+                }
+            }
+        }
+    }
+
+    Write-Log -Level INFO -Message "Registry execution surface audit: findings=$($findings.Count)"
+    return $findings
+}
+
+# =============================================================================
 # RUN
 # =============================================================================
+
+Show-Banner
 
 $allFindings = @()
 $allFindings += Invoke-DllHijackAudit
 if ($IncludeServices) { $allFindings += Invoke-ServiceAudit }
 if ($IncludeScheduledTasks) { $allFindings += Invoke-ScheduledTaskAudit }
+
+$hostContext = $null
+if ($Deep) {
+    $hostContext = Get-HostSecurityContext
+    $allFindings += Invoke-AlwaysInstallElevatedAudit
+    $allFindings += Invoke-RegistryExecutionSurfaceAudit
+}
 
 $severityOrder = @{ "Critical" = 0; "High" = 1; "Medium" = 2; "-" = 3 }
 
@@ -568,6 +897,17 @@ if (-not $Quiet) {
         else { Write-Host ("  {0,-10} {1}" -f $_.Name, $_.Count) -ForegroundColor $c }
     }
     Write-Host ""
+
+    # Coverage: "0 findings" must never be mistaken for "fully assessed"
+    if ($NoColor) { Write-Host "=== COVERAGE ===" } else { Write-Host "=== COVERAGE ===" -ForegroundColor Cyan }
+    foreach ($k in $Script:Coverage.Keys) {
+        Write-Host ("  {0,-22} {1}" -f $k, $Script:Coverage[$k]) -ForegroundColor Gray
+    }
+    if ($Script:CollectionErrors.Count -gt 0) {
+        $msg = "  $($Script:CollectionErrors.Count) object(s) could not be inspected (access denied / transient failure) - see log for detail."
+        if ($NoColor) { Write-Host $msg } else { Write-Host $msg -ForegroundColor DarkGray }
+    }
+    Write-Host ""
 }
 
 if (-not $allFindings -or $allFindings.Count -eq 0) {
@@ -588,15 +928,29 @@ else {
             $sevColor = switch ($_.Severity) { "Critical" {"#ffcccc"} "High" {"#fff2cc"} "Medium" {"#e6f2ff"} default {"#f2f2f2"} }
             "<tr style='background:$sevColor'><td>$($_.Category)</td><td>$($_.Process)</td><td>$($_.Account)</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Target))</td><td>$($_.Severity)</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Detail))</td></tr>"
         }
+        $coverageRows = ($Script:Coverage.Keys | ForEach-Object { "<tr><td>$_</td><td>$($Script:Coverage[$_])</td></tr>" }) -join "`n"
+        $errorRows = if ($Script:CollectionErrors.Count -gt 0) {
+            ($Script:CollectionErrors | ForEach-Object { "<tr><td>$([System.Web.HttpUtility]::HtmlEncode($_.Context))</td><td>$([System.Web.HttpUtility]::HtmlEncode($_.Reason))</td></tr>" }) -join "`n"
+        } else { "<tr><td colspan='2'>None</td></tr>" }
         $html = @"
 <html><head><title>PrivEsc Audit Report</title>
-<style>body{font-family:Segoe UI,Arial,sans-serif;font-size:13px} table{border-collapse:collapse;width:100%} td,th{border:1px solid #ccc;padding:6px;text-align:left} th{background:#333;color:#fff}</style>
+<style>body{font-family:Segoe UI,Arial,sans-serif;font-size:13px} table{border-collapse:collapse;width:100%;margin-bottom:20px} td,th{border:1px solid #ccc;padding:6px;text-align:left} th{background:#333;color:#fff}</style>
 </head><body>
-<h2>Local Privilege Escalation Surface Audit</h2>
-<p>Generated: $(Get-Date)</p>
+<h2>Local Privilege Escalation Surface Audit - v$ScriptVersion</h2>
+<p>Generated: $(Get-Date) | Elevated: $($prereq.IsAdmin)</p>
+<h3>Findings</h3>
 <table><tr><th>Category</th><th>Process/Task/Service</th><th>Account</th><th>Target</th><th>Severity</th><th>Detail</th></tr>
 $($rows -join "`n")
-</table></body></html>
+</table>
+<h3>Collection Coverage</h3>
+<table><tr><th>Metric</th><th>Count</th></tr>
+$coverageRows
+</table>
+<h3>Collection Errors (inaccessible objects)</h3>
+<table><tr><th>Context</th><th>Reason</th></tr>
+$errorRows
+</table>
+</body></html>
 "@
         $html | Out-File -FilePath $htmlPath -Encoding UTF8
         Write-Log -Level INFO -Message "HTML report written: $htmlPath"
