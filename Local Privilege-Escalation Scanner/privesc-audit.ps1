@@ -1,3 +1,10 @@
+<#
+PRIVESC-AUDIT.PS1  (v1.1.0)
+Local privilege-escalation surface scanner - writable DLLs/directories on
+NT AUTHORITY processes, weak service binary/registry ACLs, and SYSTEM-run
+scheduled tasks with writable action executables. Read-only, makes no changes.
+#>
+
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
